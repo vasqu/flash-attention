@@ -9,7 +9,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Boolean, Float32, Int32, Uint16, Uint32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
@@ -35,6 +35,9 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute import pipeline as pipeline_custom
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
 from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
+from flash_attn.cute.indexed_union_sm90 import QueryTileUnionSm90, apply_membership_mask
+from flash_attn.cute.indexed_score_mod import apply_indexed_score_mod_inner
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
@@ -56,13 +59,31 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        indexed_kv: bool = False,
+        indexed_topk: Optional[int] = None,
+        indexed_invalid_sentinel: int = -1,
+        indexed_mask_words: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.intra_wg_overlap = intra_wg_overlap
+        self.indexed_kv = indexed_kv
+        self.indexed_topk = indexed_topk
+        self.indexed_invalid_sentinel = indexed_invalid_sentinel
+        self.indexed_mask_words = indexed_mask_words
+        if self.indexed_kv:
+            if self.indexed_topk is None or self.indexed_topk < 1:
+                raise ValueError("indexed_topk must be positive when indexed_kv=True")
+            if self.indexed_mask_words < 1:
+                raise ValueError("indexed_mask_words must be positive when indexed_kv=True")
+            if self.tile_hdim % 64 != 0 or self.tile_hdimv % 64 != 0:
+                raise ValueError("indexed SM90 cp.async K/V currently requires head dims divisible by 64")
+        # The indexed consumer uses a variable number of K/V stages and checks
+        # a terminal metadata stage.  Keep the simpler non-overlapped sequence
+        # until that path has been independently tuned.
+        self.intra_wg_overlap = False if self.indexed_kv else intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
-        self.use_tma_KV = not paged_kv_non_tma
+        self.use_tma_KV = not paged_kv_non_tma and not self.indexed_kv
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
@@ -97,8 +118,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),
             tiler_mn=(64, self.tile_n),
@@ -106,8 +127,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, self.tile_hdimv),
@@ -128,6 +149,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
+        indexed_token_count = self.tile_n * self.num_stages if const_expr(self.indexed_kv) else 0
+        indexed_membership_count = (
+            self.tile_n * self.indexed_mask_words * self.num_stages
+            if const_expr(self.indexed_kv)
+            else 0
+        )
+        indexed_stage_count = self.num_stages if const_expr(self.indexed_kv) else 0
+        sToken_struct = cute.struct.MemRange[Int32, indexed_token_count]
+        sMembership_struct = cute.struct.MemRange[Uint32, indexed_membership_count]
+        sColumnFull_struct = cute.struct.MemRange[Uint16, indexed_token_count]
+        sValidCount_struct = cute.struct.MemRange[Int32, indexed_stage_count]
+        sFirstToken_struct = cute.struct.MemRange[Int32, indexed_stage_count]
+        sContiguous_struct = cute.struct.MemRange[Uint16, indexed_stage_count]
+        sStageFull_struct = cute.struct.MemRange[Uint16, indexed_stage_count]
         # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
@@ -142,6 +177,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQ_struct
             sK: sK_struct
             sP: sP_struct
+            sToken: sToken_struct
+            sMembership: sMembership_struct
+            sColumnFull: sColumnFull_struct
+            sValidCount: sValidCount_struct
+            sFirstToken: sFirstToken_struct
+            sContiguous: sContiguous_struct
+            sStageFull: sStageFull_struct
 
         @cute.struct
         class SharedStorageSharedQV:
@@ -151,6 +193,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
+            sToken: sToken_struct
+            sMembership: sMembership_struct
+            sColumnFull: sColumnFull_struct
+            sValidCount: sValidCount_struct
+            sFirstToken: sFirstToken_struct
+            sContiguous: sContiguous_struct
+            sStageFull: sStageFull_struct
 
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
 
@@ -172,6 +221,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mGatherKVIndices: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -181,6 +231,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+
+        if const_expr(self.indexed_kv):
+            assert mGatherKVIndices is not None, "indexed_kv requires gather indices"
+            assert mCuSeqlensQ is None and mCuSeqlensK is None
+            assert mSeqUsedQ is None and mSeqUsedK is None
+            assert mPageTable is None
+            assert blocksparse_tensors is None
+            assert not self.is_causal and not self.is_local
+            assert self.mask_mod is None
+        else:
+            assert mGatherKVIndices is None
 
         self._check_type(
             *(
@@ -365,6 +426,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            mGatherKVIndices,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -411,6 +473,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        mGatherKVIndices: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -533,6 +596,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
         # reuse sQ's data iterator
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        sToken = sMembership = sColumnFull = None
+        sValidCount = sFirstToken = sContiguous = sStageFull = None
+        if const_expr(self.indexed_kv):
+            sToken = storage.sToken.get_tensor(
+                cute.make_layout(
+                    (self.tile_n, self.num_stages),
+                    stride=(1, self.tile_n),
+                )
+            )
+            sMembership = storage.sMembership.get_tensor(
+                cute.make_layout(
+                    (self.tile_n, self.indexed_mask_words, self.num_stages),
+                    stride=(1, self.tile_n, self.tile_n * self.indexed_mask_words),
+                )
+            )
+            sColumnFull = storage.sColumnFull.get_tensor(
+                cute.make_layout(
+                    (self.tile_n, self.num_stages),
+                    stride=(1, self.tile_n),
+                )
+            )
+            stage_layout = cute.make_layout((self.num_stages,))
+            sValidCount = storage.sValidCount.get_tensor(stage_layout)
+            sFirstToken = storage.sFirstToken.get_tensor(stage_layout)
+            sContiguous = storage.sContiguous.get_tensor(stage_layout)
+            sStageFull = storage.sStageFull.get_tensor(stage_layout)
 
         block_info = BlockInfo(
             self.tile_m,
@@ -583,6 +672,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mQ,
                 mK,
                 mV,
+                mGatherKVIndices,
                 sQ,
                 sK,
                 sV,
@@ -595,6 +685,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 gmem_tiled_copy_Q,
                 mPageTable,
                 blocksparse_tensors,
+                sToken,
+                sMembership,
+                sColumnFull,
+                sValidCount,
+                sFirstToken,
+                sContiguous,
+                sStageFull,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -626,6 +723,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tidx,
                 softmax_scale_log2,
                 softmax_scale,
+                sToken,
+                sMembership,
+                sColumnFull,
+                sValidCount,
+                sStageFull,
                 block_info,
                 SeqlenInfoCls,
                 AttentionMaskCls,
@@ -641,6 +743,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mGatherKVIndices: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -653,6 +756,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         gmem_tiled_copy_Q: cute.TiledCopy,
         mPageTable: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
+        sToken: Optional[cute.Tensor],
+        sMembership: Optional[cute.Tensor],
+        sColumnFull: Optional[cute.Tensor],
+        sValidCount: Optional[cute.Tensor],
+        sFirstToken: Optional[cute.Tensor],
+        sContiguous: Optional[cute.Tensor],
+        sStageFull: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -690,6 +800,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
 
                 paged_kv_manager = None
+                indexed_kv_manager = None
                 tma_load_K_fn = None
                 tma_load_V_fn = None
                 if const_expr(self.use_tma_KV):
@@ -719,6 +830,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         tma_atom_V, 0, cute.make_layout(1), gV, sV
                     )
                     tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
+                elif const_expr(self.indexed_kv):
+                    # Indexed K/V is fixed-batch and non-paged.  The union
+                    # producer supplies one staged token list to this existing
+                    # cp.async gather manager for both K and V.
+                    mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
+                        None, None, head_idx_kv
+                    ]
+                    mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
+                        None, None, head_idx_kv
+                    ]
+                    indexed_kv_manager = CpasyncGatherKVManager.create(
+                        mGatherKVIndices,
+                        Int32(0),
+                        tidx,
+                        warp_idx_in_wg,
+                        Int32(self.indexed_topk),
+                        seqlen.seqlen_k,
+                        self.tile_n,
+                        self.tile_hdim,
+                        self.tile_hdimv,
+                        1,  # num_hdimv_splits
+                        self.num_threads_per_warp_group,
+                        mK.element_type,
+                        1,  # cta_group_size
+                        disable_bitmask=False,
+                    )
                 else:
                     # === cp_async path (paged KV with page_size != n_block_size) ===
                     paged_kv_manager = PagedKVManager.create(
@@ -762,7 +899,91 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
                     )
 
-                if const_expr(not self.use_block_sparsity):
+                if const_expr(self.indexed_kv):
+                    # Q is loaded once, exactly as in the dense path. K/V are
+                    # then produced as a compact descending union. A final metadata-only stage with
+                    # valid_count == 0 terminates the consumer loop.
+                    if const_expr(self.use_tma_Q):
+                        if warp_idx_in_wg == 0:
+                            pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                            load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                            q_producer_phase ^= 1
+                    else:
+                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                        pack_gqa.load_Q(
+                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                        )
+                        cute.arch.cp_async_commit_group()
+                        pipeline_q.producer_commit_w_index(0)
+                        q_producer_phase ^= 1
+
+                    union = QueryTileUnionSm90.create(
+                        mGatherKVIndices,
+                        batch_idx,
+                        m_block,
+                        seqlen.seqlen_q,
+                        seqlen.seqlen_k,
+                        topk=self.indexed_topk,
+                        tile_m=self.tile_m,
+                        tile_n=self.tile_n,
+                        qhead_per_kvhead=(
+                            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                        ),
+                        invalid_sentinel=self.indexed_invalid_sentinel,
+                    )
+                    has_more = Boolean(True)
+                    while has_more:
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        stage_meta = union.emit(
+                            sToken,
+                            sMembership,
+                            sColumnFull,
+                            sValidCount,
+                            sFirstToken,
+                            sContiguous,
+                            sStageFull,
+                            kv_producer_state.index,
+                        )
+                        if stage_meta.valid_count > 0:
+                            if stage_meta.is_contiguous_descending:
+                                indexed_kv_manager.load_X_contiguous_descending(
+                                    mK_cur,
+                                    sK[None, None, kv_producer_state.index],
+                                    stage_meta.first_token,
+                                    stage_meta.valid_count,
+                                    K_or_V="K",
+                                )
+                            else:
+                                indexed_kv_manager.load_index_tile_from_smem(
+                                    sToken[None, kv_producer_state.index],
+                                    stage_meta.valid_count,
+                                )
+                                indexed_kv_manager.load_X(
+                                    mK_cur,
+                                    sK[None, None, kv_producer_state.index],
+                                    transpose=False,
+                                    K_or_V="K",
+                                )
+                        cute.arch.cp_async_commit_group()
+                        pipeline_k.producer_commit(kv_producer_state)
+
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        if stage_meta.valid_count > 0:
+                            # K and V use the same row mapping. Reuse the token
+                            # registers populated for K instead of re-reading
+                            # sToken or rebuilding a contiguous sequence.
+                            indexed_kv_manager.load_X(
+                                mV_cur,
+                                sV[None, None, kv_producer_state.index],
+                                transpose=False,
+                                K_or_V="V",
+                            )
+                        cute.arch.cp_async_commit_group()
+                        pipeline_v.producer_commit(kv_producer_state)
+                        kv_producer_state.advance()
+                        has_more = stage_meta.valid_count > 0
+
+                elif const_expr(not self.use_block_sparsity):
                     n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                     # if cute.arch.thread_idx()[0] == 0:
                     #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
@@ -954,6 +1175,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tidx: Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
+        sToken: Optional[cute.Tensor],
+        sMembership: Optional[cute.Tensor],
+        sColumnFull: Optional[cute.Tensor],
+        sValidCount: Optional[cute.Tensor],
+        sStageFull: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
@@ -1043,6 +1269,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax=softmax,
             acc_O=acc_O,
         )
+        process_indexed_stage = partial(
+            self.mma_one_indexed_stage,
+            mma_qk_fn=mma_qk_fn,
+            mma_pv_fn=mma_pv_fn,
+            pipeline_k=pipeline_k,
+            pipeline_v=pipeline_v,
+            acc_O=acc_O,
+            tOrP=tOrP,
+            smem_copy_params=smem_copy_params,
+            softmax=softmax,
+            thr_mma_qk=thr_mma_qk,
+            sToken=sToken,
+            sMembership=sMembership,
+            sColumnFull=sColumnFull,
+            sValidCount=sValidCount,
+            sStageFull=sStageFull,
+        )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
 
@@ -1107,7 +1350,79 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # ==========================================
             # MAINLOOP
             # ==========================================
-            if const_expr(not self.use_block_sparsity):
+            if const_expr(self.indexed_kv):
+                # ==========================================
+                # Exact selected-index K/V union
+                # ==========================================
+                # The producer always emits a terminal metadata stage, even
+                # when the union is empty.  Consume the first real stage with
+                # the constexpr first-softmax/zero-init path, then iterate over
+                # any remaining stages with the accumulation path.
+                self.warp_scheduler_barrier_sync()
+                pipeline_k.consumer_wait(
+                    kv_consumer_state,
+                    pipeline_k.consumer_try_wait(kv_consumer_state),
+                )
+                valid_count = Int32(sValidCount[kv_consumer_state.index])
+                processed_any = Boolean(False)
+                if valid_count > 0:
+                    kv_consumer_state = process_indexed_stage(
+                        kv_consumer_state,
+                        valid_count=valid_count,
+                        batch_idx=batch_idx,
+                        head_idx=head_idx,
+                        m_block=m_block,
+                        seqlen=seqlen,
+                        softmax_scale=softmax_scale,
+                        aux_data=aux_data,
+                        is_first_stage=True,
+                    )
+                    processed_any = Boolean(True)
+                    has_more = Boolean(True)
+                    while has_more:
+                        pipeline_k.consumer_wait(
+                            kv_consumer_state,
+                            pipeline_k.consumer_try_wait(kv_consumer_state),
+                        )
+                        valid_count = Int32(sValidCount[kv_consumer_state.index])
+                        if valid_count > 0:
+                            kv_consumer_state = process_indexed_stage(
+                                kv_consumer_state,
+                                valid_count=valid_count,
+                                batch_idx=batch_idx,
+                                head_idx=head_idx,
+                                m_block=m_block,
+                                seqlen=seqlen,
+                                softmax_scale=softmax_scale,
+                                aux_data=aux_data,
+                                is_first_stage=False,
+                            )
+                        else:
+                            # Metadata-only terminal stage: no WGMMA reads.
+                            pipeline_k.consumer_release(kv_consumer_state)
+                            pipeline_v.consumer_wait(
+                                kv_consumer_state,
+                                pipeline_v.consumer_try_wait(kv_consumer_state),
+                            )
+                            pipeline_v.consumer_release(kv_consumer_state)
+                            kv_consumer_state.advance()
+                            has_more = Boolean(False)
+                else:
+                    pipeline_k.consumer_release(kv_consumer_state)
+                    pipeline_v.consumer_wait(
+                        kv_consumer_state,
+                        pipeline_v.consumer_try_wait(kv_consumer_state),
+                    )
+                    pipeline_v.consumer_release(kv_consumer_state)
+                    kv_consumer_state.advance()
+
+                pipeline_q.consumer_release_w_index(0)
+                self.warp_scheduler_barrier_arrive()
+                if not processed_any:
+                    softmax.reset()
+                    acc_O.fill(0.0)
+
+            elif const_expr(not self.use_block_sparsity):
                 # ==========================================
                 # No block-sparsity (original path)
                 # ==========================================
@@ -1344,6 +1659,120 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
         return kv_consumer_state
+
+    @cute.jit
+    def mma_one_indexed_stage(
+        self,
+        smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
+        valid_count: Int32,
+        mma_qk_fn: Callable,
+        mma_pv_fn: Callable,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        acc_O: cute.Tensor,
+        tOrP: cute.Tensor,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        thr_mma_qk,
+        sToken: cute.Tensor,
+        sMembership: cute.Tensor,
+        sColumnFull: cute.Tensor,
+        sValidCount: cute.Tensor,
+        sStageFull: cute.Tensor,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        seqlen: SeqlenInfoQK,
+        softmax_scale: Optional[Float32],
+        aux_data: AuxData,
+        is_first_stage: cutlass.Constexpr[bool],
+    ):
+        """Consume one non-empty indexed union stage.
+
+        The caller has already waited on ``pipeline_k`` so it can inspect the
+        stage's valid count.  K/V release and pipeline-state advancement remain
+        identical to the normal non-overlapped FA4 mainloop.
+        """
+
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        self.warp_scheduler_barrier_arrive()
+        warpgroup.wait_group(0)
+        pipeline_k.consumer_release(smem_pipe_read)
+
+        if const_expr(self.score_mod is not None):
+            cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+            tScS = thr_mma_qk.partition_C(cS)
+            apply_indexed_score_mod_inner(
+                acc_S,
+                tScS,
+                sToken,
+                smem_pipe_read.index,
+                valid_count,
+                self.score_mod,
+                batch_idx,
+                head_idx,
+                m_block,
+                softmax_scale,
+                self.score_vec_size,
+                self.qk_acc_dtype,
+                aux_data,
+                seqlen,
+                tile_m=self.tile_m,
+                qhead_per_kvhead=(
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                ),
+            )
+
+        # Selection is a hard mask and must run after user score_mod so a
+        # callback cannot accidentally revive a non-selected score.
+        if sStageFull[smem_pipe_read.index] == Uint16(0):
+            apply_membership_mask(
+                acc_S,
+                thr_mma_qk,
+                sMembership,
+                sColumnFull,
+                valid_count,
+                smem_pipe_read.index,
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+                qhead_per_kvhead=(
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                ),
+            )
+
+        row_scale = softmax.online_softmax(
+            acc_S,
+            is_first=is_first_stage,
+            check_inf=True,
+        )
+        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+        tOrP_cur = (
+            tOrP
+            if const_expr(self.mma_pv_is_rs)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
+        )
+        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        if const_expr(not self.mma_pv_is_rs):
+            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+        softmax.rescale_O(acc_O, row_scale)
+        if const_expr(not self.mma_pv_is_rs):
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+
+        pipeline_v.consumer_wait(
+            smem_pipe_read,
+            pipeline_v.consumer_try_wait(smem_pipe_read),
+        )
+        self.warp_scheduler_barrier_sync()
+        mma_pv_fn(
+            B_idx=smem_pipe_read.index,
+            zero_init=is_first_stage,
+            wg_wait=0,
+        )
+        pipeline_v.consumer_release(smem_pipe_read)
+        smem_pipe_read.advance()
+        return smem_pipe_read
 
     @cute.jit
     def mma_one_n_block(

@@ -36,6 +36,21 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn.cute.indexed_block_sparse import (
+    build_indexed_block_sparse_tensors_cute_cached,
+)
+from flash_attn.cute.indexed_bitmask import (
+    build_indexed_topk_bitmask_cached,
+)
+from flash_attn.cute.indexed_dense_sm90 import IndexedDenseSm90
+from flash_attn.cute.indexed_decode_sm90 import IndexedRowAttentionSm90
+from flash_attn.cute.indexed_policy import IndexedPath, choose_indexed_plan
+from flash_attn.cute.indexed_prepare import cast_indexed_kv_indices, prepare_indexed_kv_indices
+from flash_attn.cute.indexed_score_mod import (
+    build_topk_bitmask,
+    topk_bitmask_score_mod,
+)
+from flash_attn.cute.sm90_tile_safety import choose_safe_sm90_fwd_tile
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -296,6 +311,565 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
         local = False
     return causal, local, window_size_left, window_size_right
 
+def _flash_attn_fwd_indexed_sm90(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gather_kv_indices: torch.Tensor,
+    *,
+    softmax_scale: Optional[float],
+    causal: bool,
+    softcap: Optional[float],
+    window_size_left: Optional[int],
+    window_size_right: Optional[int],
+    learnable_sink: Optional[torch.Tensor],
+    tile_mn: Optional[Tuple[int, int]],
+    mma_pv_is_rs: Optional[bool],
+    intra_wg_overlap: Optional[bool],
+    num_threads: int,
+    num_splits: int,
+    pack_gqa: Optional[bool],
+    arch: Optional[int],
+    score_mod: Optional[Callable],
+    mask_mod: Optional[Callable],
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch],
+    return_lse: bool,
+    out: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    aux_tensors: Optional[list[torch.Tensor]],
+    aux_scalars: Optional[tuple],
+    q_descale: Optional[torch.Tensor],
+    k_descale: Optional[torch.Tensor],
+    v_descale: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor],
+    seqused_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    min_seqlen_k: Optional[int],
+    page_table: Optional[torch.Tensor],
+    gather_kv_indices_prepared: bool,
+    indexed_backend: Optional[str],
+    indexed_union_compute_inflation_hint: Optional[float],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], None, None]:
+    """Forward-only exact selected-index attention on SM90.
+
+    ``gather_kv_indices`` has shape ``[batch, seqlen_q, topk]`` and may be in
+    any order. The low-Q warp path consumes that order directly. The WGMMA
+    cross-query union path lazily prepares a private descending int32 tensor;
+    callers do not need to sort or normalize indices.
+
+    Entries are expected to be unique, as produced by a normal top-k selection.
+    Invalid or out-of-range entries are skipped. An ordinary FA4 ``score_mod``
+    is supported and receives the original absolute selected K/V coordinate.
+    """
+
+    q, k, v, gather_kv_indices = [
+        maybe_contiguous(t) for t in (q, k, v, gather_kv_indices)
+    ]
+    aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if softcap not in (None, 0.0):
+        if score_mod is not None:
+            raise ValueError("softcap and score_mod cannot be used together")
+        score_mod = utils.create_softcap_scoremod(softcap)
+    if q is None or k is None:
+        raise ValueError("indexed K/V requires both q and k")
+    if any(t is not None for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)):
+        raise NotImplementedError("indexed K/V currently supports fixed-batch tensors only")
+    if page_table is not None:
+        raise NotImplementedError("indexed K/V and paged K/V cannot be combined yet")
+    if causal or window_size_left is not None or window_size_right is not None:
+        raise NotImplementedError("causal/local masking is not supported by indexed K/V yet")
+    if mask_mod is not None:
+        raise NotImplementedError(
+            "indexed K/V supports score_mod but not mask_mod; express coordinate-dependent "
+            "masking by returning -inf from score_mod"
+        )
+    if learnable_sink is not None:
+        raise NotImplementedError("learnable_sink is not supported by indexed K/V yet")
+    if block_sparse_tensors is not None:
+        raise NotImplementedError("block sparsity and indexed K/V are mutually exclusive")
+    if (aux_tensors is not None or aux_scalars is not None) and score_mod is None:
+        raise ValueError("aux_tensors/aux_scalars require score_mod for indexed K/V")
+    if any(t is not None for t in (q_descale, k_descale, v_descale)):
+        raise NotImplementedError("FP8 descales are not supported by indexed K/V")
+    if any(t.requires_grad for t in (q, k, v)):
+        raise NotImplementedError("indexed K/V is forward-only in this implementation")
+
+    selected_arch = _get_device_arch() if arch is None else arch
+    if selected_arch // 10 != 9:
+        raise NotImplementedError("indexed K/V currently targets SM90/SM90a only")
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("indexed K/V expects q, k, v with shape [B, S, H, D]")
+    batch_size, seqlen_q, num_head, head_dim = q.shape
+    batch_k, seqlen_k, num_head_kv, head_dim_k = k.shape
+    if batch_k != batch_size or v.shape[:3] != (batch_size, seqlen_k, num_head_kv):
+        raise ValueError("q, k, and v batch/sequence/head shapes are inconsistent")
+    if head_dim_k != head_dim:
+        raise ValueError("q and k head dimensions must match")
+    head_dim_v = v.shape[-1]
+    if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError("indexed K/V supports matching float16 or bfloat16 q/k/v tensors")
+    if num_head % num_head_kv != 0:
+        raise ValueError("query heads must be divisible by K/V heads")
+    supported_indexed_dims = {64, 96, 128, 192, 256}
+    if head_dim not in supported_indexed_dims or head_dim_v not in supported_indexed_dims:
+        raise ValueError(
+            "indexed SM90 currently requires QK and V dimensions in {64,96,128,192,256}"
+        )
+    if gather_kv_indices.ndim != 3 or gather_kv_indices.shape[:2] != (batch_size, seqlen_q):
+        raise ValueError("gather_kv_indices must have shape [batch, seqlen_q, topk]")
+    if gather_kv_indices.dtype not in (torch.int32, torch.int64, torch.uint16):
+        raise TypeError("gather_kv_indices must be int32, int64, or uint16")
+    if gather_kv_indices.stride(-1) != 1:
+        raise ValueError("gather_kv_indices must be contiguous in its last dimension")
+    topk = gather_kv_indices.shape[-1]
+    if topk < 1:
+        raise ValueError("gather_kv_indices topk dimension must be positive")
+    if seqlen_k >= 2**31:
+        raise ValueError("indexed SM90 requires seqlen_k to fit in signed int32")
+    if max_seqlen_q is not None and max_seqlen_q != seqlen_q:
+        raise ValueError("max_seqlen_q must match q.shape[1] for indexed fixed-batch attention")
+    if max_seqlen_k is not None and max_seqlen_k != seqlen_k:
+        raise ValueError("max_seqlen_k must match k.shape[1] for indexed fixed-batch attention")
+    if min_seqlen_k is not None and min_seqlen_k != seqlen_k:
+        raise ValueError("min_seqlen_k must match k.shape[1] for indexed fixed-batch attention")
+
+    if not is_fake_mode():
+        if not all(t.is_cuda for t in (q, k, v, gather_kv_indices)):
+            raise ValueError("indexed q/k/v/indices must be CUDA tensors")
+        num_sms = torch.cuda.get_device_properties(v.device).multi_processor_count
+    else:
+        num_sms = 132
+
+    device = v.device
+    out_shape = (batch_size, seqlen_q, num_head, head_dim_v)
+    lse_shape = (batch_size, num_head, seqlen_q)
+    if seqlen_q == 0 or seqlen_k == 0:
+        if out is None:
+            out = torch.empty(out_shape, dtype=q.dtype, device=device)
+        else:
+            _validate_tensor(out, "out", out_shape, q.dtype, device)
+        if lse is None:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if return_lse else None
+        else:
+            _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+        out.zero_()
+        if lse is not None:
+            lse.fill_(float("-inf"))
+        return out, lse, None, None
+
+    plan = choose_indexed_plan(
+        batch_size=batch_size,
+        query_length=seqlen_q,
+        kv_length=seqlen_k,
+        query_heads=num_head,
+        kv_heads=num_head_kv,
+        qk_head_dim=head_dim,
+        value_head_dim=head_dim_v,
+        topk=topk,
+        sm_count=num_sms,
+        backend=indexed_backend,
+        has_score_mod=score_mod is not None,
+        union_compute_inflation_hint=indexed_union_compute_inflation_hint,
+    )
+    if plan.path != IndexedPath.DENSE_INDEXED and pack_gqa is not None and pack_gqa != plan.pack_gqa:
+        raise ValueError(
+            f"indexed policy selected pack_gqa={plan.pack_gqa}; explicit pack_gqa={pack_gqa} is incompatible"
+        )
+    if plan.path != IndexedPath.DENSE_INDEXED and tile_mn is not None and tile_mn != (plan.tile_m, plan.tile_n):
+        raise ValueError(
+            f"indexed policy selected tile_mn={(plan.tile_m, plan.tile_n)}; explicit tile_mn={tile_mn} is incompatible"
+        )
+    if mma_pv_is_rs is False:
+        raise ValueError("indexed SM90 currently uses the register-source PV path")
+    if intra_wg_overlap is True:
+        raise ValueError("indexed SM90 currently disables intra-warpgroup overlap")
+    if num_threads != 384:
+        raise ValueError("indexed SM90 uses one 128-thread producer WG plus FA4 MMA WGs (num_threads=384)")
+
+    is_union = plan.path in (IndexedPath.UNION_FA4, IndexedPath.PACKED_UNION_FA4)
+    is_block_sparse_indexed = plan.path == IndexedPath.BLOCK_SPARSE_INDEXED
+    is_fa4_bitmask_indexed = plan.path == IndexedPath.FA4_BITMASK_INDEXED
+    is_dense_indexed = plan.path == IndexedPath.DENSE_INDEXED
+    is_wgmma_indexed = is_union
+    bitmask = None
+    kernel_indices = None
+    if is_block_sparse_indexed:
+        if score_mod is not None:
+            raise ValueError("block_sparse_indexed cannot compose a user score_mod")
+        if num_splits not in (0, 1):
+            raise ValueError("block_sparse_indexed uses one exact FA4 sparse pass")
+        # Native CuTe bitmask packing consumes the public integer dtype
+        # directly; avoid a full-tensor int64-to-int32 conversion.
+        kernel_indices = gather_kv_indices
+    elif is_fa4_bitmask_indexed:
+        if score_mod is not None:
+            raise ValueError("fa4_bitmask_indexed cannot compose a user score_mod")
+        if num_splits not in (0, 1):
+            raise ValueError("fa4_bitmask_indexed uses one exact FA4 pass")
+        # The exact short-prefill bitmask packer accepts int32/int64/uint16.
+        kernel_indices = gather_kv_indices
+    elif is_dense_indexed:
+        if score_mod is not None:
+            raise ValueError("dense_indexed cannot compose a user score_mod; use row or union")
+    elif is_wgmma_indexed:
+        if num_splits not in (0, 1):
+            raise ValueError("indexed WGMMA FA4 does not use split-KV; set num_splits to 1")
+        if gather_kv_indices_prepared:
+            if gather_kv_indices.dtype != torch.int32:
+                raise TypeError("prepared union indices must be int32")
+            kernel_indices = gather_kv_indices
+        else:
+            kernel_indices = prepare_indexed_kv_indices(gather_kv_indices, seqlen_k)
+    else:
+        if num_splits > 16:
+            raise ValueError("indexed row attention supports at most 16 splits")
+        kernel_indices = cast_indexed_kv_indices(gather_kv_indices, seqlen_k)
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    if out is None:
+        out = torch.empty(out_shape, dtype=q.dtype, device=device)
+    else:
+        _validate_tensor(out, "out", out_shape, q.dtype, device)
+    if lse is None:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if return_lse else None
+    else:
+        _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+
+    if is_fa4_bitmask_indexed:
+        bitmask = build_indexed_topk_bitmask_cached(
+            kernel_indices,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+        )
+        # The short GLM family consistently favors ordinary FA4 128x64 over
+        # IndexedDenseSm90.  Re-enter FA4 with the exact cached top-k bitmask;
+        # stream-local workspace ordering makes reuse safe without a sync.
+        return _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            tile_mn=(128, 64),
+            mma_pv_is_rs=True,
+            intra_wg_overlap=False,
+            num_threads=384,
+            num_splits=1,
+            pack_gqa=False,
+            _arch=selected_arch,
+            score_mod=topk_bitmask_score_mod,
+            return_lse=return_lse,
+            out=out,
+            lse=lse,
+            aux_tensors=[bitmask],
+        )
+
+    if is_block_sparse_indexed:
+        sparse_blocks, sparse_bitmask, _ = (
+            build_indexed_block_sparse_tensors_cute_cached(
+                kernel_indices,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                tile_m=128,
+                tile_n=64,
+            )
+        )
+        # Re-enter the ordinary FA4 path without gather_kv_indices.  The exact
+        # selected-token bitmask remains the score modifier inside every active
+        # K/V tile, while FA4's native sparse scheduler skips inactive tiles.
+        return _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            tile_mn=(128, 64),
+            mma_pv_is_rs=True,
+            intra_wg_overlap=False,
+            num_threads=384,
+            num_splits=1,
+            pack_gqa=False,
+            _arch=selected_arch,
+            score_mod=topk_bitmask_score_mod,
+            block_sparse_tensors=sparse_blocks,
+            return_lse=return_lse,
+            out=out,
+            lse=lse,
+            aux_tensors=[sparse_bitmask],
+        )
+
+    dtype = torch2cute_dtype_map[q.dtype]
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
+    aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors) if aux_tensors is not None else None
+    aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
+    cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors] if aux_tensors is not None else None
+    aux_data_cute = AuxData(cute_aux_tensors, aux_scalars)
+    aux_data_runtime = AuxData(aux_tensors, aux_scalars)
+    invalid_sentinel = -1
+
+    q_tensor, k_tensor, v_tensor, out_tensor = [to_cute_tensor(t) for t in (q, k, v, out)]
+    indices_tensor = (
+        to_cute_tensor(kernel_indices, assumed_align=4, leading_dim=2)
+        if kernel_indices is not None
+        else None
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    if is_dense_indexed:
+        fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, False, False)
+        dense_tile_m, dense_tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+        safe_tile = choose_safe_sm90_fwd_tile(
+            tile_m=dense_tile_m,
+            tile_n=dense_tile_n,
+            head_dim=head_dim,
+            value_head_dim=head_dim_v,
+            mma_pv_is_rs=fwd_cfg.mma_pv_is_rs,
+            num_stages=2,
+        )
+        dense_tile_m, dense_tile_n = safe_tile.tile_m, safe_tile.tile_n
+        ratio = num_head // num_head_kv
+        dense_pack_gqa = ratio > 1 and dense_tile_m % ratio == 0
+        if pack_gqa is not None:
+            dense_pack_gqa = bool(pack_gqa)
+            if dense_pack_gqa and dense_tile_m % ratio:
+                raise ValueError("dense indexed pack_gqa requires tile_m divisible by the GQA ratio")
+        if tile_mn is not None:
+            dense_tile_m, dense_tile_n = tile_mn
+        lse_tensor = to_cute_tensor(lse, assumed_align=4)
+        compile_key = (
+            "dense_indexed", dtype, head_dim, head_dim_v, ratio,
+            dense_tile_m, dense_tile_n, dense_pack_gqa, lse is None,
+        )
+        if compile_key not in _flash_attn_fwd_indexed_sm90.compile_cache:
+            # The aux tensor's shape/stride metadata is needed only while
+            # compiling a new specialization.  On a cache hit, delay the GPU
+            # bitmask construction until every Python/CuTe launch decision is
+            # complete so the attention launch follows it immediately on the
+            # same stream instead of leaving a host-side scheduling bubble.
+            bitmask = build_topk_bitmask(
+                gather_kv_indices, seqlen_k, assume_unique=True
+            )
+            bitmask_cute = to_cute_aux_tensor(bitmask)
+            dense_aux_cute = AuxData([bitmask_cute], None)
+            dense_fwd = IndexedDenseSm90(
+                dtype, head_dim, head_dim_v, ratio,
+                pack_gqa=dense_pack_gqa,
+                tile_m=dense_tile_m,
+                tile_n=dense_tile_n,
+                mma_pv_is_rs=fwd_cfg.mma_pv_is_rs,
+                intra_wg_overlap=fwd_cfg.intra_wg_overlap,
+            )
+            _flash_attn_fwd_indexed_sm90.compile_cache[compile_key] = cute.compile(
+                dense_fwd, q_tensor, k_tensor, v_tensor, out_tensor, lse_tensor,
+                softmax_scale, None, None, None, None, None, None, None, None,
+                None, None, dense_aux_cute, stream, options="--enable-tvm-ffi",
+            )
+        if not is_fake_mode():
+            if bitmask is None:
+                bitmask = build_topk_bitmask(
+                    gather_kv_indices, seqlen_k, assume_unique=True
+                )
+            dense_aux_runtime = AuxData([bitmask], None)
+            _flash_attn_fwd_indexed_sm90.compile_cache[compile_key](
+                q.detach(), k.detach(), v.detach(), out.detach(), lse,
+                softmax_scale, None, None, None, None, None, None, None, None,
+                None, None, dense_aux_runtime,
+            )
+    elif is_wgmma_indexed:
+        lse_tensor = to_cute_tensor(lse, assumed_align=4)
+        compile_key = (
+            "union",
+            dtype,
+            head_dim,
+            head_dim_v,
+            num_head // num_head_kv,
+            topk,
+            plan.tile_m,
+            plan.tile_n,
+            plan.num_stages,
+            plan.pack_gqa,
+            plan.mask_words,
+            score_mod_hash,
+            aux_tensor_metadata,
+            aux_scalar_metadata,
+            lse is None,
+        )
+        if compile_key not in _flash_attn_fwd_indexed_sm90.compile_cache:
+            fa_fwd = FlashAttentionForwardSm90(
+                dtype,
+                head_dim,
+                head_dim_v,
+                num_head // num_head_kv,
+                is_causal=False,
+                is_local=False,
+                pack_gqa=plan.pack_gqa,
+                tile_m=plan.tile_m,
+                tile_n=plan.tile_n,
+                num_stages=plan.num_stages,
+                num_threads=384,
+                Q_in_regs=False,
+                intra_wg_overlap=False,
+                mma_pv_is_rs=True,
+                indexed_kv=True,
+                indexed_topk=topk,
+                indexed_invalid_sentinel=invalid_sentinel,
+                indexed_mask_words=plan.mask_words,
+                score_mod=score_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
+            _flash_attn_fwd_indexed_sm90.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                out_tensor,
+                lse_tensor,
+                softmax_scale,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                indices_tensor,
+                aux_data_cute,
+                stream,
+                options="--enable-tvm-ffi",
+            )
+        if not is_fake_mode():
+            _flash_attn_fwd_indexed_sm90.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                out.detach(),
+                lse,
+                softmax_scale,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                kernel_indices.detach(),
+                aux_data_runtime,
+            )
+    else:
+        decode_splits = num_splits if num_splits > 1 else plan.decode_splits
+        decode_splits = max(1, min(int(decode_splits), 16))
+        direct_output = decode_splits == 1
+
+        if direct_output:
+            decode_out = out
+            decode_lse = lse
+        else:
+            decode_out = torch.empty(
+                decode_splits,
+                batch_size,
+                seqlen_q,
+                num_head,
+                head_dim_v,
+                dtype=torch.float32,
+                device=device,
+            )
+            # The combine kernel expects a logical [split,B,Q,H] view whose
+            # Q dimension is contiguous (stride[2] == 1), matching upstream
+            # FA4's lse_partial.transpose(-1, -2) convention.
+            decode_lse_storage = torch.empty(
+                decode_splits,
+                batch_size,
+                num_head,
+                seqlen_q,
+                dtype=torch.float32,
+                device=device,
+            )
+            decode_lse = decode_lse_storage.transpose(-1, -2)
+
+        decode_out_tensor = to_cute_tensor(decode_out)
+        # Split LSE is a logical [split, B, Q, H] view backed by
+        # [split, B, H, Q] storage, so Q (dimension 2) is the unit-stride
+        # dimension.  The default converter assumes the last dimension is
+        # leading; that only happened to work for Q=1 because stride(H)==Q.
+        decode_lse_tensor = (
+            to_cute_tensor(decode_lse, assumed_align=4)
+            if direct_output
+            else to_cute_tensor(decode_lse, assumed_align=4, leading_dim=2)
+        )
+        compile_key = (
+            "decode",
+            dtype,
+            head_dim,
+            head_dim_v,
+            topk,
+            decode_splits,
+            plan.decode_rows_per_cta,
+            plan.decode_heads_per_warp,
+            direct_output,
+            score_mod_hash,
+            aux_tensor_metadata,
+            aux_scalar_metadata,
+            decode_lse is None,
+        )
+        if compile_key not in _flash_attn_fwd_indexed_sm90.compile_cache:
+            decode = IndexedRowAttentionSm90(
+                dtype,
+                head_dim,
+                head_dim_v,
+                topk,
+                rows_per_cta=plan.decode_rows_per_cta,
+                heads_per_warp=plan.decode_heads_per_warp,
+                invalid_sentinel=invalid_sentinel,
+                direct_output=direct_output,
+                score_mod=score_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
+            _flash_attn_fwd_indexed_sm90.compile_cache[compile_key] = cute.compile(
+                decode,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                indices_tensor,
+                decode_out_tensor,
+                decode_lse_tensor,
+                softmax_scale,
+                Int32(decode_splits),
+                aux_data_cute,
+                stream,
+                options="--enable-tvm-ffi",
+            )
+        if not is_fake_mode():
+            _flash_attn_fwd_indexed_sm90.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                kernel_indices.detach(),
+                decode_out,
+                decode_lse,
+                softmax_scale,
+                decode_splits,
+                aux_data_runtime,
+            )
+        if not direct_output:
+            _flash_attn_fwd_combine(
+                decode_out,
+                decode_lse,
+                out,
+                lse.transpose(-1, -2) if lse is not None else None,
+            )
+
+    return out, lse, None, None
+
+
+_flash_attn_fwd_indexed_sm90.compile_cache = get_jit_cache("fwd_indexed_sm90")
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -334,6 +908,9 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    gather_kv_indices_prepared: bool = False,
+    indexed_backend: Optional[str] = None,
+    indexed_union_compute_inflation_hint: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -348,7 +925,33 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
+        indexed_backend: Optional indexed-CuTe backend override: auto, row, grouped,
+            scalar, union, fa4_bitmask, block_sparse, or dense.
+        indexed_union_compute_inflation_hint: Optional caller-provided estimate of
+            union compute inflation. Auto dispatch uses it only in a narrow high-overlap
+            GQA crossover; attention never profiles indices or synchronizes to obtain it.
     """
+    if gather_kv_indices is not None and qv is None:
+        return _flash_attn_fwd_indexed_sm90(
+            q, k, v, gather_kv_indices,
+            softmax_scale=softmax_scale, causal=causal, softcap=softcap,
+            window_size_left=window_size_left, window_size_right=window_size_right,
+            learnable_sink=learnable_sink, tile_mn=tile_mn,
+            mma_pv_is_rs=mma_pv_is_rs, intra_wg_overlap=intra_wg_overlap,
+            num_threads=num_threads, num_splits=num_splits, pack_gqa=pack_gqa,
+            arch=_arch, score_mod=score_mod, mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors, return_lse=return_lse,
+            out=out, lse=lse, aux_tensors=aux_tensors, aux_scalars=aux_scalars,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q, seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            min_seqlen_k=min_seqlen_k, page_table=page_table,
+            gather_kv_indices_prepared=gather_kv_indices_prepared,
+            indexed_backend=indexed_backend,
+            indexed_union_compute_inflation_hint=indexed_union_compute_inflation_hint,
+        )
+
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
@@ -547,6 +1150,27 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+
+    # Some valid asymmetric SM90 head-dimension pairs select an upstream tile
+    # whose dynamic shared-memory allocation exceeds H100's 232,448-byte
+    # launch limit (or whose M192 wide-V variant exhausts ptxas registers).
+    # Cap only automatically selected, ordinary dense/score-mod tiles; explicit
+    # user tiles and block-sparse layouts retain their existing contract.
+    if arch // 10 == 9 and tile_mn is None and not use_block_sparsity:
+        safe_tile = choose_safe_sm90_fwd_tile(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            head_dim=head_dim,
+            value_head_dim=head_dim_v,
+            mma_pv_is_rs=mma_pv_is_rs,
+            num_stages=2,
+        )
+        tile_m, tile_n = safe_tile.tile_m, safe_tile.tile_n
+        if pack_gqa and tile_m % qhead_per_kvhead != 0:
+            # M192 is divisible by uncommon ratios such as 6, while the safe
+            # wide-V M128 tile is not.  Unpacked GQA is semantically identical
+            # and avoids compiling an invalid packed-M layout.
+            pack_gqa = False
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -1023,10 +1647,12 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
-            compile_args.extend([
-                sparse_tensors,
-                AuxData(cute_aux_tensors, aux_scalars),
-            ])
+            compile_args.append(sparse_tensors)
+            if arch // 10 == 9:
+                # FlashAttentionForwardSm90 has an optional indexed-K/V
+                # argument before AuxData; dense SM90 passes None.
+                compile_args.append(None)
+            compile_args.append(AuxData(cute_aux_tensors, aux_scalars))
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1087,7 +1713,7 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
-            call_args.extend([
+            call_args.append(
                 (
                     normalized_block_sparse_tensors.mask_block_cnt,
                     normalized_block_sparse_tensors.mask_block_idx,
@@ -1099,9 +1725,11 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.dq_write_order_full,
                 )
                 if normalized_block_sparse_tensors is not None
-                else None,
-                AuxData(aux_tensors, aux_scalars),
-            ])
+                else None
+            )
+            if arch // 10 == 9:
+                call_args.append(None)
+            call_args.append(AuxData(aux_tensors, aux_scalars))
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(

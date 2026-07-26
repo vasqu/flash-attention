@@ -70,7 +70,11 @@ class CpasyncGatherKVManager(ParamsBase):
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
     ):
-        assert tile_n % num_threads == 0
+        # One 128-thread producer warpgroup owns the copy.  ``tile_n`` does
+        # not need to be a multiple of 128: for N < 128 only the row-owner
+        # lanes that are actually consumed load an index; for N > 128 each
+        # thread owns ceil(N / 128) index registers.
+        assert tile_n % 16 == 0
         assert num_threads == 128
         assert hdim % 64 == 0
         assert (hdim_v // num_hdimv_splits // cta_group_size) % 64 == 0
@@ -99,7 +103,7 @@ class CpasyncGatherKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        topk_indices_per_thread = tile_n // num_threads
+        topk_indices_per_thread = cute.ceil_div(tile_n, num_threads)
 
         rTopk = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
         rTopkHalf = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
@@ -148,17 +152,106 @@ class CpasyncGatherKVManager(ParamsBase):
                 * (self.num_threads // self.gmem_threads_per_row)
                 + (self.thread_idx // self.gmem_threads_per_row)
             )
-            # need this if not offset in load_X
-            # if const_expr(not transpose):
-            #     row += self.cta_rank_in_cluster * (self.tile_n//self.cta_group_size)
-            #     row = row % self.tile_n
+            value = Int32(-1)
             row_idx = n_block * self.tile_n + row
-            rTopk[i] = self.mIndexTopk[row_idx]
+            if row < self.tile_n and row_idx < self.topk_length:
+                value = Int32(self.mIndexTopk[row_idx])
+            rTopk[i] = value
 
             if const_expr(not transpose and not self.disable_bitmask):
                 row_non_interleaved = i * self.num_threads + self.thread_idx
                 row_idx_non_interleaved = n_block * self.tile_n + row_non_interleaved
-                self.rTopk_NonInterleaved[0] = self.mIndexTopk[row_idx_non_interleaved]
+                value_non_interleaved = Int32(-1)
+                if (
+                    row_non_interleaved < self.tile_n
+                    and row_idx_non_interleaved < self.topk_length
+                ):
+                    value_non_interleaved = Int32(
+                        self.mIndexTopk[row_idx_non_interleaved]
+                    )
+                self.rTopk_NonInterleaved[i] = value_non_interleaved
+
+
+    @cute.jit
+    def load_index_tile_from_smem(
+        self,
+        sToken: cute.Tensor,
+        valid_count: Int32,
+        transpose: bool = False,
+    ):
+        """Load one staged physical-token tile into the existing pointer registers.
+
+        ``sToken`` is a one-dimensional shared-memory view of length ``tile_n``.
+        The interleaved row ownership exactly matches :meth:`load_X`, so the
+        existing subgroup shuffles continue to broadcast one row pointer to
+        all vector lanes.  This is the path used by indexed FA4 union stages.
+        """
+
+        entries_per_thread = self.topk_indices_per_thread
+        rTopk = self.rTopk if const_expr(transpose) else self.rTopkHalf
+        rows_per_lane_group = self.num_threads // self.gmem_threads_per_row
+
+        for i in cutlass.range_constexpr(entries_per_thread):
+            row = (
+                i * self.num_threads
+                + (self.thread_idx % self.gmem_threads_per_row) * rows_per_lane_group
+                + (self.thread_idx // self.gmem_threads_per_row)
+            )
+            value = Int32(-1)
+            if row < valid_count and row < self.tile_n:
+                value = Int32(sToken[row])
+            rTopk[i] = value
+
+    @cute.jit
+    def load_index_tile_contiguous_descending(
+        self,
+        first_token: Int32,
+        valid_count: Int32,
+        transpose: bool = False,
+    ):
+        """Materialize ``first_token - row`` without reading a shared token tile."""
+
+        entries_per_thread = self.topk_indices_per_thread
+        rTopk = self.rTopk if const_expr(transpose) else self.rTopkHalf
+        rows_per_lane_group = self.num_threads // self.gmem_threads_per_row
+
+        for i in cutlass.range_constexpr(entries_per_thread):
+            row = (
+                i * self.num_threads
+                + (self.thread_idx % self.gmem_threads_per_row) * rows_per_lane_group
+                + (self.thread_idx // self.gmem_threads_per_row)
+            )
+            value = Int32(-1)
+            if row < valid_count and row < self.tile_n:
+                value = first_token - row
+            rTopk[i] = value
+
+    @cute.jit
+    def load_X_contiguous_descending(
+        self,
+        mX: cute.Tensor,
+        sX: cute.Tensor,
+        first_token: Int32,
+        valid_count: Int32,
+        *,
+        K_or_V: str,
+        transpose: bool = False,
+        d_offset: int = 0,
+    ):
+        """Load a descending contiguous stage through the normal 128-bit copy atom."""
+
+        self.load_index_tile_contiguous_descending(
+            first_token,
+            valid_count,
+            transpose=transpose,
+        )
+        self.load_X(
+            mX,
+            sX,
+            transpose=transpose,
+            K_or_V=K_or_V,
+            d_offset=d_offset,
+        )
 
     @cute.jit
     def compute_bitmask(

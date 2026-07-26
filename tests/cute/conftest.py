@@ -1,71 +1,41 @@
-import os
-import subprocess
-import logging
-import tempfile
-import json
-import time
+"""Make FA4 CuTe tests runnable when only ``flash-attn-4`` is installed.
+
+The legacy parent package may eagerly import ``flash_attn_2_cuda``.  FA4's
+Python/CuTe modules do not need that extension, so expose the repository's
+``flash_attn`` directory as a lightweight namespace before test collection.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
 from pathlib import Path
-from getpass import getuser
+import sys
+import types
 
 
-def _get_gpu_ids():
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible:
-        return [g.strip() for g in visible.split(",")]
-
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip().splitlines()
-    except (FileNotFoundError,):
-        pass
-
-    logging.warning("Failed to get gpu ids, use default '0'")
-    return ["0"]
-
-
-def pytest_configure(config):
-    tmp = Path(tempfile.gettempdir()) / getuser() / "flash_attention_tests"
-    tmp.mkdir(parents=True, exist_ok=True)
-
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
-    logging.basicConfig(
-        format=config.getini("log_file_format"),
-        filename=str(tmp / f"tests_{worker_id}.log"),
-        level=config.getini("log_file_level"),
-    )
-    if not worker_id:
-        return
-    worker_num = int(worker_id.replace("gw", ""))
-
-    # cache gpu_ids, because nvidia-smi is expensive when we launch many workers doing torch initialization
-    # Always elect worker_0 to get gpu_ids.
-    cached_gpu_ids = tmp / "gpu_ids.json"
-    if worker_num == 0:
-        gpu_ids = _get_gpu_ids()
-        with cached_gpu_ids.open(mode="w") as f:
-            json.dump(gpu_ids, f)
-    else:
-        while not cached_gpu_ids.exists():
-            time.sleep(1)
-        with cached_gpu_ids.open() as f:
-            gpu_ids = json.load(f)
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
-
-def pytest_collection_finish(session):
-    if not session.config.option.collectonly:
+def _install_fa4_namespace() -> None:
+    package_dir = Path(__file__).resolve().parents[2] / "flash_attn"
+    cute_interface = package_dir / "cute" / "interface.py"
+    if not cute_interface.is_file():
         return
 
-    # file_name -> test_name -> counter
-    test_counts: dict[str, dict[str, int]] = {}
-    for item in session.items:
-        funcname = item.function.__name__
-        parent = test_counts.setdefault(item.parent.name, {})
-        parent[funcname] = parent.setdefault(funcname, 0) + 1
-    print(json.dumps(test_counts, indent=2))
+    existing = sys.modules.get("flash_attn")
+    existing_paths = list(getattr(existing, "__path__", ())) if existing else []
+    if str(package_dir) in existing_paths:
+        return
+
+    for name in tuple(sys.modules):
+        if name == "flash_attn" or name.startswith("flash_attn."):
+            del sys.modules[name]
+
+    module = types.ModuleType("flash_attn")
+    module.__file__ = str(package_dir / "__init__.py")
+    module.__package__ = "flash_attn"
+    module.__path__ = [str(package_dir)]
+    spec = importlib.machinery.ModuleSpec("flash_attn", loader=None, is_package=True)
+    spec.submodule_search_locations = [str(package_dir)]
+    module.__spec__ = spec
+    sys.modules["flash_attn"] = module
+
+
+_install_fa4_namespace()
